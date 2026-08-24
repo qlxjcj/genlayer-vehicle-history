@@ -21,6 +21,7 @@ from conftest import (
     VERDICT_MALFORMED,
     VERDICT_SALVAGE,
     LLM_PATTERN,
+    with_source,
 )
 
 
@@ -98,6 +99,7 @@ def test_process_damaged(direct_vm, vh):
     vm, c = vh
     vm.clear_mocks()
     vm.mock_llm(LLM_PATTERN, VERDICT_DAMAGED)
+    with_source(vm)
     c.submit_vehicle(VIN, "BMW", "328i", "2013")
     c.process_vehicle(1)
 
@@ -112,6 +114,7 @@ def test_process_flooded(direct_vm, vh):
     vm, c = vh
     vm.clear_mocks()
     vm.mock_llm(LLM_PATTERN, VERDICT_FLOODED)
+    with_source(vm)
     c.submit_vehicle(VIN, "BMW", "328i", "2013")
     c.process_vehicle(1)
 
@@ -124,6 +127,7 @@ def test_process_salvage(direct_vm, vh):
     vm, c = vh
     vm.clear_mocks()
     vm.mock_llm(LLM_PATTERN, VERDICT_SALVAGE)
+    with_source(vm)
     c.submit_vehicle(VIN, "BMW", "328i", "2013")
     c.process_vehicle(1)
 
@@ -147,26 +151,37 @@ def test_record_queries_authoritative_sources(direct_vm, vh):
     assert any("iaai.com" in u for u in urls)          # IAA salvage auction
     assert len(urls) == 4
     assert VIN.upper() in urls[0]
-    # no source mocked -> all retrieval attempts recorded as failed
-    assert all(s["retrieved"] is False for s in rec["sources"])
-    assert all(s["excerpt"] == "" for s in rec["sources"])
+    # fixture mocks nhtsa.gov (body references the VIN) as retrieved; the others
+    # either failed or returned a non-VIN body -> recorded as not retrieved.
+    nhtsa = next(s for s in rec["sources"] if "nhtsa.gov" in s["url"])
+    assert nhtsa["retrieved"] is True
+    assert all(s["retrieved"] is False for s in rec["sources"] if "nhtsa.gov" not in s["url"])
 
 
 def test_record_preserves_retrieval_details(direct_vm, vh):
     vm, c = vh
-    vm.mock_web(r".*nhtsa\.gov.*", {
-        "method": "GET", "status": 200,
-        "body": "Recall 24V-001 applies to this VIN. Battery fire risk.",
-    })
     c.submit_vehicle(VIN, "BMW", "328i", "2013")
     c.process_vehicle(1)
 
     rec = _record(c, VIN)
     nhtsa = next(s for s in rec["sources"] if "nhtsa.gov" in s["url"])
     assert nhtsa["retrieved"] is True
-    assert "Recall 24V-001" in nhtsa["excerpt"]
-    others = [s for s in rec["sources"] if "nhtsa.gov" not in s["url"]]
-    assert all(s["retrieved"] is False for s in others)
+    assert VIN in nhtsa["excerpt"]
+
+
+def test_generic_page_without_vin_does_not_count_as_retrieved(direct_vm, vh):
+    vm, c = vh
+    vm.clear_mocks()
+    vm.mock_llm(LLM_PATTERN, VERDICT_CLEAN)
+    # A 200 response whose body does NOT mention the VIN must not count as a
+    # retrieved VIN-specific source -> hard source requirement forces INCONCLUSIVE.
+    vm.mock_web(r".*nhtsa\.gov.*", {"method": "GET", "status": 200, "body": "Welcome to NHTSA. Search recalls here."})
+    c.submit_vehicle(VIN, "BMW", "328i", "2013")
+    c.process_vehicle(1)
+
+    v = _verdict(c, 1)
+    assert v["status"] == "INCONCLUSIVE"
+    assert all(s["retrieved"] is False for s in v["sources"])
 
 
 # ---------- explicit inconclusive ----------
@@ -186,19 +201,41 @@ def test_inconclusive_explicit(direct_vm, vh):
     assert _record(c, VIN)["status"] == "INCONCLUSIVE"
 
 
-# ---------- verdict normalization ----------
+# ---------- hard source requirement ----------
 
-def test_verdict_normalized(direct_vm, vh):
+def test_no_source_forces_inconclusive(direct_vm, vh):
+    # LLM says CLEAN but no authoritative source was retrieved -> forced INCONCLUSIVE.
     vm, c = vh
     vm.clear_mocks()
-    vm.mock_llm(LLM_PATTERN, VERDICT_MALFORMED)
+    vm.mock_llm(LLM_PATTERN, VERDICT_CLEAN)
     c.submit_vehicle(VIN, "BMW", "328i", "2013")
     c.process_vehicle(1)
 
     v = _verdict(c, 1)
-    assert v["status"] == "DAMAGED"                 # derived from recalled=True
-    assert v["severity"] == "NONE"                  # invalid level coerced
-    assert v["matched_records"] == ["NHTSA-R2024-001"]  # string -> list
+    assert v["status"] == "INCONCLUSIVE"
+    assert v["recalled"] is False
+    assert v["matched_records"] == []
+    assert "INCONCLUSIVE" in v["reasoning"]
+    assert all(s["retrieved"] is False for s in v["sources"])
+
+
+# ---------- verdict normalization ----------
+
+def test_verdict_normalized_missing_status_is_inconclusive(direct_vm, vh):
+    vm, c = vh
+    vm.clear_mocks()
+    vm.mock_llm(LLM_PATTERN, VERDICT_MALFORMED)
+    with_source(vm)
+    c.submit_vehicle(VIN, "BMW", "328i", "2013")
+    c.process_vehicle(1)
+
+    v = _verdict(c, 1)
+    # Missing/unsupported status is NEVER derived to CLEAN (or DAMAGED); it
+    # defaults to INCONCLUSIVE so a bad vehicle cannot silently pass.
+    assert v["status"] == "INCONCLUSIVE"
+    assert v["recalled"] is False
+    assert v["severity"] == "NONE"
+    assert v["matched_records"] == []
 
 
 # ---------- reusable on-chain record ----------
@@ -277,6 +314,7 @@ def test_inconclusive_record_can_be_improved_by_anyone(direct_vm, vh, direct_bob
     vm.sender = direct_bob
     vm.clear_mocks()
     vm.mock_llm(LLM_PATTERN, VERDICT_DAMAGED)
+    with_source(vm)
     c.submit_vehicle(VIN, "BMW", "328i", "2013")
     c.process_vehicle(2)
     rec = _record(c, VIN)
@@ -312,6 +350,7 @@ def test_stats_counts_statuses(direct_vm, vh):
 
     vm.clear_mocks()
     vm.mock_llm(LLM_PATTERN, VERDICT_FLOODED)
+    vm.mock_web(r".*iaai\.com.*", {"method": "GET", "status": 200, "body": "Flood loss for VIN 1G1JC5444R7252296 at IAA."})
     c.submit_vehicle("1G1JC5444R7252296", "Chevrolet", "Camaro", "1994")
     c.process_vehicle(2)
 

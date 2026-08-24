@@ -65,10 +65,20 @@ VERDICT_MALFORMED = json.dumps({
 
 LLM_PATTERN = r".*vehicle-history screening engine.*"
 
+# A successful authoritative source whose body references the VIN, so verdicts
+# have at least one VIN-specific retrieved source.
+SOURCE_OK = r".*nhtsa\.gov.*"
+SOURCE_BODY = "No open recalls for VIN " + VIN + ". History clean."
+
+
+def with_source(vm, body=SOURCE_BODY):
+    vm.mock_web(SOURCE_OK, {"method": "GET", "status": 200, "body": body})
+
 
 @pytest.fixture
 def vh(direct_vm, direct_deploy):
     vm = direct_vm
     vm.mock_llm(LLM_PATTERN, VERDICT_CLEAN)
+    with_source(vm)
     c = direct_deploy(CONTRACT)
     return vm, c

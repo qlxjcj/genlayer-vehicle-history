@@ -55,6 +55,14 @@ class VehicleHistory(gl.Contract):
     def _authoritative_urls(self, vin: str) -> list:
         return [base + vin for base in self.AUTHORITATIVE_SOURCES]
 
+    def _source_retrieved(self, url: str, body: str, vin: str) -> bool:
+        # A source only counts as retrieved when the response body is non-empty
+        # AND actually references this VIN, so a generic landing/error page
+        # never counts as VIN-specific evidence.
+        if not body:
+            return False
+        return vin.upper() in body.upper()
+
     def _check(self, vin: str, make: str, model: str, year: str) -> dict:
         def gather_and_check() -> dict:
             sources = []
@@ -63,8 +71,9 @@ class VehicleHistory(gl.Contract):
                 try:
                     content = gl.nondet.web.get(url)
                     body = self._decode_body(content)[:1200]
-                    texts.append(f"[{url}]\n{body}")
-                    sources.append({"url": url, "retrieved": True, "excerpt": body[:400]})
+                    retrieved = self._source_retrieved(url, body, vin)
+                    texts.append(f"[{url}] [{'OK' if retrieved else 'NO_VIN'}]\n{body}")
+                    sources.append({"url": url, "retrieved": retrieved, "excerpt": body[:400]})
                 except Exception:
                     texts.append(f"[{url}] [FETCH_FAILED]")
                     sources.append({"url": url, "retrieved": False, "excerpt": ""})
@@ -115,9 +124,11 @@ matched_records=[].
         principle = (
             "Two results are equivalent if status "
             "(CLEAN/DAMAGED/FLOODED/SALVAGE/INCONCLUSIVE), recalled (bool), and "
-            "severity (NONE/LOW/MEDIUM/HIGH/CRITICAL) match exactly, and "
-            "matched_records contains the same record identifiers (order-insensitive). "
-            "reasoning and sources may differ in wording."
+            "severity (NONE/LOW/MEDIUM/HIGH/CRITICAL) match exactly, "
+            "matched_records contains the same record identifiers (order-insensitive), "
+            "and sources contains the same (url, retrieved) pairs (order-insensitive) "
+            "so validators agree on which authoritative sources were actually "
+            "retrieved for this VIN. reasoning and excerpt wording may differ."
         )
         return gl.eq_principle.prompt_comparative(gather_and_check, principle)
 
@@ -133,12 +144,9 @@ matched_records=[].
 
         status = str(v.get("status", "")).upper()
         if status not in self.STATUSES:
-            if recalled:
-                status = "DAMAGED"
-            elif severity == "NONE" and not matched:
-                status = "CLEAN"
-            else:
-                status = "INCONCLUSIVE"
+            # Missing/unsupported status is never derived to CLEAN (which would
+            # silently pass a bad vehicle). Default to INCONCLUSIVE.
+            status = "INCONCLUSIVE"
         # Keep the enum self-consistent.
         if status == "CLEAN":
             recalled = False
@@ -204,6 +212,21 @@ matched_records=[].
         verdict = self._normalize_verdict(
             self._check(vehicle["vin"], vehicle["make"], vehicle["model"], vehicle["year"])
         )
+
+        # Hard source requirement: if no authoritative source was successfully
+        # retrieved for this VIN, force INCONCLUSIVE regardless of what the LLM
+        # returned. A CLEAN verdict must rest on VIN-specific evidence, not on
+        # generic page responses or empty results.
+        if not any(s.get("retrieved") for s in verdict.get("sources", [])):
+            forced = {
+                "status": "INCONCLUSIVE",
+                "recalled": False,
+                "severity": "NONE",
+                "matched_records": [],
+                "reasoning": "No authoritative VIN-specific source could be retrieved; verdict forced to INCONCLUSIVE.",
+                "sources": verdict.get("sources", []),
+            }
+            verdict = self._normalize_verdict(forced)
 
         # Reusable record is keyed by normalized VIN. Guard against an unrelated
         # caller (or a VIN collision with different identity) silently replacing
